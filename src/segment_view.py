@@ -42,10 +42,10 @@ class OdomVisualizer:
 
         # --- Subscribers ---
         # 1. Camera Info (for calibration parameters)
-        rospy.Subscriber("/camera/color/camera_info", CameraInfo, self._camera_info_callback, queue_size=1)
+        rospy.Subscriber("/camera/depth/camera_info", CameraInfo, self._camera_info_callback, queue_size=1)
 
         # 2. Aligned Depth Image (for the visual background)
-        depth_sub = message_filters.Subscriber("/camera/aligned_depth_to_color/image_raw", Image)
+        depth_sub = message_filters.Subscriber("/camera/depth/image_rect_raw", Image)
         # 3. Odometry Message (for tracking state)
         odom_sub = message_filters.Subscriber("/tracked_odom", Odometry)
         

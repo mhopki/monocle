@@ -49,9 +49,9 @@ class PixelOdometryNode:
         self.odom_pub = rospy.Publisher("/tracked_odom", Odometry, queue_size=1) 
 
         # --- Subscribers ---
-        rospy.Subscriber("/camera/color/camera_info", CameraInfo, self.camera_info_callback, queue_size=1)
+        rospy.Subscriber("/camera/depth/camera_info", CameraInfo, self.camera_info_callback, queue_size=1)
         rospy.Subscriber("/tracked_pixel_location", Point, self.pixel_location_callback, queue_size=1)
-        rospy.Subscriber("/camera/aligned_depth_to_color/image_raw", Image, self.depth_callback, queue_size=1)
+        rospy.Subscriber("/camera/depth/image_rect_raw", Image, self.depth_callback, queue_size=1)
         
         rospy.loginfo("Pixel Odometry Node initialized with Kalman Filter. Waiting for Intrinsics...")
 
