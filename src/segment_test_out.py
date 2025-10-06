@@ -15,6 +15,8 @@ class TemplateDepthTracker:
     """
     Decoupled tracker that switches from Color-Aligned setup (needed for Zero-Shot) 
     to the faster RAW DEPTH pipeline for continuous tracking.
+    
+    The initial kernel acquisition now uses rospy.wait_for_message to bypass time synchronization issues.
     """
 
     MAX_DEPTH_VALUE = 1000.0  
@@ -42,12 +44,13 @@ class TemplateDepthTracker:
         self.intrinsics_ready = False
         
         # --- Tracking State ---
-        self.kernel_inv = None          # Stores the inverted depth template (32FC1)
-        self.kernel_pos = None          # Stores the positive depth template (8UC1)
-        self.kernel_pos_mask = None     # Stores the mask for the positive kernel (32FC1)
-        self.kernel_avg_depth = None    # Stores the average reference depth (for filtering)
+        self.kernel_inv = None          
+        self.kernel_pos = None          
+        self.kernel_pos_mask = None     
+        self.kernel_avg_depth = None    
         self.kernel_w = 0               
         self.kernel_h = 0               
+        self.setup_complete = False
 
         # Publishers
         self.tracked_depth_pub = rospy.Publisher("/tracked_raw_depth_visualization", Image, queue_size=1)
@@ -55,29 +58,18 @@ class TemplateDepthTracker:
         self.kernel_pub = rospy.Publisher("/tracking_kernel", Image, queue_size=1, latch=True)
         self.location_pub = rospy.Publisher("/tracked_pixel_location", Point, queue_size=1) 
 
-        # STAGE 1: Setup & Kernel Acquisition 
-        
-        # Subscribe to both Camera Info topics for the transformation parameters
+        # STAGE 1: Setup - Subscribe to Info Topics
         rospy.Subscriber("/camera/color/camera_info", CameraInfo, self._color_info_callback, queue_size=1)
         rospy.Subscriber("/camera/depth/camera_info", CameraInfo, self._depth_info_callback, queue_size=1)
 
-        # Synchronize the segmented output (aligned data) and the fast raw depth data
-        self.kernel_sub = message_filters.Subscriber("/segmented_depth_image", Image)
-        self.raw_depth_sub = message_filters.Subscriber("/camera/depth/image_raw", Image)
-        
-        self.ts_setup = message_filters.ApproximateTimeSynchronizer(
-            [self.kernel_sub, self.raw_depth_sub], 
-            queue_size=10, 
-            slop=0.1
-        )
-        self.ts_setup.registerCallback(self.kernel_acquisition_callback)
+        # Start a timer to periodically check if setup is ready
+        self.setup_timer = rospy.Timer(rospy.Duration(0.5), self._setup_check_timer)
 
         rospy.loginfo("STAGE 1: Waiting for Intrinsics and /segmented_depth_image...")
 
     # --- INTRINSICS CALLBACKS ---
 
     def _check_intrinsics_ready(self):
-        # Check if all 8 critical intrinsic values have been loaded
         if self.color_fx != 0.0 and self.depth_fx != 0.0:
              self.intrinsics_ready = True
              rospy.loginfo("Intrinsics for Color and Depth frames successfully loaded.")
@@ -98,7 +90,11 @@ class TemplateDepthTracker:
             self.depth_cy = info_msg.K[5]
             self._check_intrinsics_ready()
 
-    # --- END INTRINSICS CALLBACKS ---
+    def _setup_check_timer(self, event):
+        """Timer event to poll for readiness and start kernel acquisition."""
+        if self.intrinsics_ready and not self.setup_complete:
+            self.setup_timer.shutdown()
+            self.kernel_acquisition() # Call the blocking acquisition function
 
     # --- UTILITY METHODS ---
 
@@ -120,18 +116,14 @@ class TemplateDepthTracker:
     def _map_color_pixel_to_depth_pixel(self, color_pixel_x, color_pixel_y, depth_z):
         """
         Remaps a pixel from the color frame to the depth frame using intrinsic matrices.
-        This compensates for the lack of hardware alignment in the RAW depth stream.
         """
         if not self.intrinsics_ready:
             return None, None
 
-        # 1. Project Color Pixel to 3D in the Color Frame (X_c, Y_c, Z_c)
         X_c = (color_pixel_x - self.color_cx) * depth_z / self.color_fx
         Y_c = (color_pixel_y - self.color_cy) * depth_z / self.color_fy
         Z_c = depth_z
         
-        # 2. Project 3D point back to 2D in the Depth Frame
-        # Assumes the raw depth frame is close enough to the color frame's optical center.
         depth_pixel_x = (X_c / Z_c) * self.depth_fx + self.depth_cx
         depth_pixel_y = (Y_c / Z_c) * self.depth_fy + self.depth_cy
 
@@ -188,24 +180,27 @@ class TemplateDepthTracker:
         
         return inverted_kernel, avg_depth
 
-
-    def kernel_acquisition_callback(self, segmented_depth_data, raw_depth_data):
+    def kernel_acquisition(self):
         """
-        Executes once to generate the kernel(s), finds the necessary transform, and 
-        transitions to the fast tracking loop.
+        BLOCKING Acquisition: Fetches the segmented message and the corresponding raw depth message
+        to generate the kernel, ensuring the setup phase is robust.
         """
-        if self.kernel_inv is not None or self.kernel_pos is not None:
-            # Protection against multiple calls before unregister completes
-            return
+        rospy.loginfo("Waiting for segmented depth message...")
+        try:
+            # 1. BLOCK: Fetch the segmented message (this is the static kernel source)
+            segmented_depth_data = rospy.wait_for_message("/segmented_depth_image", Image, timeout=10.0)
+            rospy.loginfo("Received /segmented_depth_image.")
             
-        if not self.intrinsics_ready:
-            rospy.logwarn_throttle(1.0, "Waiting for all camera intrinsics...")
-            return
+            # 2. BLOCK: Fetch the current raw depth image
+            raw_depth_data = rospy.wait_for_message("/camera/depth/image_raw", Image, timeout=10.0)
+            rospy.loginfo("Received /camera/depth/image_raw.")
 
-        rospy.loginfo("Intrinsics and segmented depth received. Starting kernel generation...")
+        except rospy.ROSException:
+            rospy.logerr("Setup failed: Timeout waiting for kernel or raw depth messages. Shutting down.")
+            rospy.signal_shutdown("Setup failed.")
+            return
 
         try:
-            # The SEGMENTED depth image is ALIGNED data (Color Frame pixels)
             segmented_depth_array = self.convert_to_32fc1_meters(segmented_depth_data, segmented_depth_data.encoding)
             raw_depth_array = self.convert_to_32fc1_meters(raw_depth_data, raw_depth_data.encoding)
             
@@ -213,14 +208,14 @@ class TemplateDepthTracker:
             valid_object_pixels = segmented_depth_array[object_mask_full]
 
             if valid_object_pixels.size == 0:
-                rospy.logwarn("Segmented image is empty. Kernel creation failed.")
+                rospy.logerr("Segmented image is empty. Kernel creation failed.")
                 return
 
             # --- 1. DETERMINE PIXEL REMAPPING FROM ALIGNED/COLOR FRAME TO RAW DEPTH FRAME ---
             y_coords, x_coords = np.where(object_mask_full)
             center_pixel_color_frame_x = np.mean(x_coords)
             center_pixel_color_frame_y = np.mean(y_coords)
-            center_depth_aligned = np.mean(valid_object_pixels) # Metric depth of the center
+            center_depth_aligned = np.mean(valid_object_pixels) 
 
             # Convert the Center of the Object from the Color Frame to the Raw Depth Frame
             depth_x, depth_y = self._map_color_pixel_to_depth_pixel(
@@ -229,105 +224,71 @@ class TemplateDepthTracker:
                 center_depth_aligned
             )
             
-            # --- 2. EXTRACT KERNEL BOUNDS (CRUCIAL: The kernel needs to be extracted from the FAST RAW depth image) ---
+            # --- 2. EXTRACT KERNEL BOUNDS ---
             
-            # Use the original mask bounds, but center the final kernel extraction around the new (depth_x, depth_y) point.
-            # Since the raw image may be different resolution, we must recenter the mask.
-            
-            mask_w = x_max - x_min + 1
-            mask_h = y_max - y_min + 1
+            mask_w = np.max(x_coords) - np.min(x_coords) + 1
+            mask_h = np.max(y_coords) - np.min(y_coords) + 1
 
-            # Define new bounds centered on the remapped pixel (depth_x, depth_y)
             self.kernel_w = mask_w
             self.kernel_h = mask_h
             
+            # Calculate CLAMPED, RECENTERED bounds on the RAW image
+            raw_h, raw_w = raw_depth_array.shape
             y_min_raw = int(depth_y - mask_h / 2)
             y_max_raw = int(depth_y + mask_h / 2)
             x_min_raw = int(depth_x - mask_w / 2)
             x_max_raw = int(depth_x + mask_w / 2)
 
-            # Ensure bounds are within the RAW image limits
-            raw_h, raw_w = raw_depth_array.shape
+            y_min_clamped = max(0, y_min_raw)
+            y_max_clamped = min(raw_h, y_max_raw)
+            x_min_clamped = max(0, x_min_raw)
+            x_max_clamped = min(raw_w, x_max_raw)
             
-            if y_min_raw < 0 or y_max_raw > raw_h or x_min_raw < 0 or x_max_raw > raw_w:
-                 rospy.logwarn("Kernel bounds fall outside raw depth image. Adjust depth_tolerance or check camera alignment.")
-                 return # Fail if bounds are bad
+            if (y_max_clamped - y_min_clamped < 10) or (x_max_clamped - x_min_clamped < 10):
+                 rospy.logerr("Clamped kernel is too small. Setup failed.")
+                 return
             
-            # --- 3. GENERATE KERNELS ---
+            # --- 3. GENERATE KERNELS using the CLAMPED, RECENTERED RAW DEPTH PATCH ---
             
-            # NOTE: We use the segmented_depth_array mask but extract the patch from raw_depth_array.
-            # This requires creating a new mask specific to the RAW patch size.
-            
-            # Simple approach: Extract the raw patch and use a generic circle/rectangle based on the size
-            # Since the aligned mask geometry is complex, we stick to the original bounds for now
-            
-            # FOR THIS FIX: We extract the kernel using the bounds derived from the ALIGNED data
-            # but apply it to the RAW data, assuming resolutions are roughly the same.
-            # A full fix requires projecting the entire mask, which is overkill.
+            avg_depth_inv = None
+            avg_depth_pos = None
 
-            # We stick to the simplest transfer: extracting the kernel from the raw data using 
-            # the bounds derived from the ALIGNED data for consistency.
-            
-            self.kernel_inv, avg_depth_inv = self._generate_inverted_kernel(
-                 segmented_depth_array, raw_depth_array, y_min, y_max, x_min, x_max
-            )
-            self.kernel_pos, self.kernel_pos_mask, avg_depth_pos = self._generate_positive_kernel(
-                 segmented_depth_array, y_min, y_max, x_min, x_max, valid_object_pixels
-            )
-            
-            # Use avg_depth from the kernel mode we choose for filtering
             if self.tracking_mode in ['inverted', 'combined']:
+                 self.kernel_inv, avg_depth_inv = self._generate_inverted_kernel(
+                      segmented_depth_array, raw_depth_array, y_min_clamped, y_max_clamped, x_min_clamped, x_max_clamped
+                 )
+            if self.tracking_mode in ['positive', 'combined']:
+                 self.kernel_pos, self.kernel_pos_mask, avg_depth_pos = self._generate_positive_kernel(
+                      segmented_depth_array, y_min_clamped, y_max_clamped, x_min_clamped, x_max_clamped, valid_object_pixels
+                 )
+            
+            # Determine overall reference depth
+            if self.tracking_mode == 'inverted' and avg_depth_inv is not None:
                  self.kernel_avg_depth = avg_depth_inv 
                  log_type = "INVERTED"
-            elif self.tracking_mode == 'positive':
+            elif self.tracking_mode == 'positive' and avg_depth_pos is not None:
                  self.kernel_avg_depth = avg_depth_pos
                  log_type = "POSITIVE"
-            
+            elif self.tracking_mode == 'combined' and avg_depth_pos is not None:
+                 self.kernel_avg_depth = avg_depth_pos # Combined mode uses positive avg depth for filtering
+                 log_type = "COMBINED"
+            else:
+                 rospy.logerr("Kernel generation failed in chosen mode.")
+                 return
+
             # --- FINAL VISUALIZATION & SWITCH ---
             kernel_to_vis = self.kernel_inv if self.kernel_inv is not None else self.kernel_pos
             kernel_vis_8u = cv2.normalize(kernel_to_vis, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
             kernel_msg = self.bridge.cv2_to_imgmsg(kernel_vis_8u, "mono8")
             self.kernel_pub.publish(kernel_msg)
             
-            rospy.loginfo("STAGE 1 COMPLETE: Kernel acquired. Pipeline switched to RAW DEPTH.")
-            rospy.loginfo(f"RAW DEPTH CENTER: ({depth_x}, {depth_y}) | Starting tracking loop.")
+            self.setup_complete = True
+            rospy.loginfo("STAGE 1 COMPLETE: Kernel acquired. Starting tracking loop.")
             
-            self.ts_setup.unregister() 
             self.start_tracking_loop()
 
         except Exception as e:
             rospy.logerr(f"Error during critical kernel acquisition phase: {e}")
-
-    # --- KERNEL ACQUISITION END ---
-    
-    # ... (Rest of the helper functions remain the same) ...
-    # Removed for brevity, but they are in the final file block.
-    
-    # ----------------------------------------------------
-    # The REST of the original code (including tracking_callback) is fully inserted below
-    # ----------------------------------------------------
-    
-    def _generate_inverted_kernel(self, segmented_depth_array, raw_depth_array, y_min, y_max, x_min, x_max):
-        """Generates a 32FC1 kernel that masks the object and matches the background depth profile."""
-        
-        kernel_patch_raw = raw_depth_array[y_min:y_max+1, x_min:x_max+1].copy()
-
-        object_mask_patch = ~np.isnan(segmented_depth_array[y_min:y_max+1, x_min:x_max+1])
-        
-        inverted_kernel = kernel_patch_raw.copy()
-        inverted_kernel[object_mask_patch] = np.nan
-        
-        background_pixels = inverted_kernel[~np.isnan(inverted_kernel)]
-        if background_pixels.size == 0:
-            rospy.logwarn("Inverted kernel has no valid background pixels.")
-            return None, None
-            
-        avg_depth = np.nanmean(background_pixels)
-
-        inverted_kernel[np.isnan(inverted_kernel)] = 0.0
-        
-        return inverted_kernel, avg_depth
-
 
     def start_tracking_loop(self):
         """
@@ -339,7 +300,7 @@ class TemplateDepthTracker:
         raw_depth_sub = message_filters.Subscriber("/camera/depth/image_raw", Image)
         color_sub = message_filters.Subscriber("/camera/color/image_raw", Image)
 
-        # Synchronize only the two necessary streams
+        # Synchronize only the two necessary streams (raw depth and color)
         self.ts = message_filters.ApproximateTimeSynchronizer(
             [raw_depth_sub, color_sub], 
             queue_size=10, 
@@ -354,6 +315,9 @@ class TemplateDepthTracker:
         The continuous, high-frequency callback executed upon receiving synchronized
         raw depth and color images. Performs template matching and visualization.
         """
+        if not self.setup_complete:
+            return
+            
         if self.kernel_inv is None and self.kernel_pos is None:
             rospy.logwarn_throttle(5.0, "Tracking callback received data, but no kernel is set. Waiting.")
             return
@@ -364,7 +328,6 @@ class TemplateDepthTracker:
         best_kernel = None  
 
         try:
-            # NOTE: raw_depth_data is now from /camera/depth/image_raw (fastest topic)
             raw_depth_array = self.convert_to_32fc1_meters(raw_depth_data, raw_depth_data.encoding)
 
             # --- CONTINUOUS TRACKING ---
