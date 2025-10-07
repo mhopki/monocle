@@ -192,8 +192,8 @@ class TemplateDepthTracker:
             rospy.loginfo("Received /segmented_depth_image.")
             
             # 2. BLOCK: Fetch the current raw depth image
-            raw_depth_data = rospy.wait_for_message("/camera/depth/image_raw", Image, timeout=10.0)
-            rospy.loginfo("Received /camera/depth/image_raw.")
+            raw_depth_data = rospy.wait_for_message("/camera/depth/image_rect_raw", Image, timeout=10.0)
+            rospy.loginfo("Received /camera/depth/image_rect_raw.")
 
         except rospy.ROSException:
             rospy.logerr("Setup failed: Timeout waiting for kernel or raw depth messages. Shutting down.")
@@ -297,7 +297,7 @@ class TemplateDepthTracker:
         rospy.loginfo("STAGE 2 STARTING: Initiating high-speed tracking loop...")
         
         # FIX: Subscribing to RAW DEPTH /image_raw topic
-        raw_depth_sub = message_filters.Subscriber("/camera/depth/image_raw", Image)
+        raw_depth_sub = message_filters.Subscriber("/camera/depth/image_rect_raw", Image)
         color_sub = message_filters.Subscriber("/camera/color/image_raw", Image)
 
         # Synchronize only the two necessary streams (raw depth and color)
