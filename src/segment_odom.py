@@ -37,10 +37,11 @@ class PixelOdometryNode:
         
         # --- Kalman Filter State ---
         self.kf_initialized = False
-        self.dt = rospy.get_param('~nominal_dt', 1.0) # Time step (1.0 for 1 FPS, as discussed)
         
-        # CRITICAL LAG FIX: Time (in seconds) to predict forward to compensate for system lag.
-        # Set to 1.0 to predict exactly to the next frame time, compensating for latency.
+        # FIX 1: Update nominal dt to 1/30 (0.0333...)
+        self.dt = rospy.get_param('~nominal_dt', 1.0/30.0) 
+        
+        # FIX 2: Predictive time step is now 1/30 second
         self.PREDICTIVE_TIME_STEP = rospy.get_param('~predictive_dt', self.dt * 1.0) 
         
         self._initialize_kalman_filter()
@@ -53,7 +54,7 @@ class PixelOdometryNode:
         rospy.Subscriber("/tracked_pixel_location", Point, self.pixel_location_callback, queue_size=1)
         rospy.Subscriber("/camera/depth/image_rect_raw", Image, self.depth_callback, queue_size=1)
         
-        rospy.loginfo("Pixel Odometry Node initialized with Kalman Filter. Waiting for Intrinsics...")
+        rospy.loginfo(f"Pixel Odometry Node initialized. Nominal FPS: {1.0/self.dt:.1f}Hz")
 
     def _initialize_kalman_filter(self):
         """Initializes the 6-state (Position + Velocity) Kalman Filter."""
@@ -71,18 +72,17 @@ class PixelOdometryNode:
             [0, 0, 1, 0, 0, 0]
         ])
 
-        # Base Process Noise Covariance (Q_base): Allows for rapid changes in velocity/acceleration
-        Q_std = 0.5 
-        self.Q_base = np.eye(6) * Q_std**2
-
+        # FIX 3: Base Process Noise Covariance (Q_base) calculation is now based on the SMALLER dt
+        Q_std = 0.01  
+        self.Q_base = np.eye(6) * Q_std**2 # We use this simple Q matrix
+        
         # Measurement Noise Covariance (R): Near-perfect trust in the sensor (3x3)
-        R_std = 1e-6 # Set extremely low to minimize lag and follow measurement instantly
+        R_std = 0.01
         self.R = np.eye(3) * R_std**2
 
         # Initial State Covariance (P): High initial uncertainty
-        self.P = np.eye(6) * 1.0
+        self.P = np.eye(6) * 1.0 
 
-        # Adaptive Scaling Factor (starts at 1.0)
         self.current_Q_scale = 1.0 
         self.kf_initialized = False
 
@@ -90,56 +90,37 @@ class PixelOdometryNode:
         """KF Prediction step (based on constant velocity model)."""
         
         # Update F matrix with current dt
+        # Note: dt is now small (0.033s), ensuring the prediction is only for a short time slice.
         self.F[0, 3] = dt
         self.F[1, 4] = dt
         self.F[2, 5] = dt
         
-        # 1. Predict state: x = F @ x
         self.x = self.F @ self.x 
 
-        # Apply Adaptive Noise Scaling to Q
         Q_adaptive = self.Q_base * self.current_Q_scale 
 
-        # 2. Predict covariance: P = F @ P @ F.T + Q_adaptive
         self.P = self.F @ self.P @ self.F.T + Q_adaptive 
 
     def _update_kalman_filter(self, z):
-        """
-        KF Update step (incorporate measurement z=[X, Y, Z]) and calculates adaptive scaling.
-        """
+        """KF Update step (incorporate measurement z=[X, Y, Z]) and calculates adaptive scaling."""
         
-        # 1. Innovation (Residual): y = z - H @ x
         y = z - self.H @ self.x
 
-        # 2. Innovation Covariance: S = H @ P @ H.T + R
         S = self.H @ self.P @ self.H.T + self.R
 
-        # --- Adaptive Noise Calculation ---
-        # Calculate Mahalanobis Distance (gamma)
-        # gamma = y.T @ inv(S) @ y
-        # We handle the dot product manually for robustness
         gamma = y.T @ np.linalg.inv(S) @ y 
         
-        # Threshold for Chi-Squared Distribution (e.g., 95% confidence for 3 degrees of freedom)
         CHI2_THRESHOLD = 7.815 
         
-        # Calculate scaling factor based on innovation magnitude
         if gamma[0, 0] > CHI2_THRESHOLD:
-            # High innovation: Measurement strongly disagrees with prediction (sudden motion/error).
-            # Increase Q significantly to reduce trust in prediction and accept the measurement faster.
-            self.current_Q_scale = 10.0 # Aggressive scaling factor
-            rospy.logdebug(f"KF Adaptation: High innovation (gamma={gamma[0, 0]:.1f}). Scaling Q by 10.")
+            self.current_Q_scale = 10.0
         else:
-            # Low innovation: Prediction is close to measurement. Reduce scaling.
             self.current_Q_scale = 1.0 
             
-        # 3. Kalman Gain: K = P @ H.T @ inv(S)
         K = self.P @ self.H.T @ np.linalg.inv(S)
 
-        # 4. Update state: x = x + K @ y
         self.x = self.x + K @ y
 
-        # 5. Update covariance: P = (I - K @ H) @ P
         I = np.eye(6)
         self.P = (I - K @ self.H) @ self.P
 
@@ -150,7 +131,6 @@ class PixelOdometryNode:
         F_future[1, 4] = future_dt
         F_future[2, 5] = future_dt
         
-        # Predict the state forward (we only care about the position part for the published pose)
         x_future = F_future @ self.x
         return x_future
         
@@ -159,7 +139,6 @@ class PixelOdometryNode:
         if self.intrinsics_ready: return
 
         try:
-            # P matrix is 3x4, K matrix is 3x3. Accessing P[0, 5, 2, 6] is typically robust.
             P = camera_info_msg.P
             self.fx = P[0]
             self.fy = P[5]
@@ -224,18 +203,18 @@ class PixelOdometryNode:
     def _update_odometry(self, current_measurement, current_time, header):
         """
         Calculates and publishes the Odometry message using the Kalman Filter.
-        current_measurement is geometry_msgs/Point (X, Y, Z) OR None.
         """
         
         # 0. Calculate Delta Time
         if self.last_time is not None:
             dt = (current_time - self.last_time).to_sec()
-            # If the actual dt is much larger than the nominal dt (e.g., missed frames), use actual dt for prediction.
-            if dt < 0 or dt > (self.dt * 1.5):
-                 rospy.logwarn_throttle(2.0, f"Large dt detected: {dt:.2f}s. Using actual dt for prediction.")
-            self.dt = dt
+            
+            # Clamp dt for sanity checks, but rely on actual dt for prediction
+            if dt < 0 or dt > (self.dt * 5): 
+                 dt = self.dt 
+            self.dt = dt # The internal dt variable tracks the actual time difference
         else:
-            self.dt = self.dt # Use nominal dt for first prediction
+            self.dt = 1.0/30.0 # Use actual nominal dt for first prediction
 
         self._predict_kalman_filter(self.dt) # Predict to the current time step (t + dt)
 
@@ -246,9 +225,8 @@ class PixelOdometryNode:
             if not self.kf_initialized:
                 self.x[:3] = z
                 self.kf_initialized = True
-                rospy.loginfo("Kalman Filter initialized with first measurement.")
             else:
-                self._update_kalman_filter(z) # Correct the prediction with the current measurement
+                self._update_kalman_filter(z)
         
         # 2. Publish Smoothed State (WITH LAG COMPENSATION)
         if self.kf_initialized:
@@ -258,11 +236,9 @@ class PixelOdometryNode:
 
             current_pose = Point(x=x_future[0, 0], y=x_future[1, 0], z=x_future[2, 0])
             
-            # Twist is based on the current estimated velocity (from self.x, post-update)
             vx, vy, vz = self.x[3, 0], self.x[4, 0], self.x[5, 0]
 
             # Calculate Orientation (Yaw) from estimated velocity
-            # Yaw is calculated from the velocity vector (vx, vy)
             current_yaw = math.atan2(vx, vy) 
             current_orientation = self._get_quaternion_from_yaw(current_yaw)
 
@@ -286,7 +262,6 @@ class PixelOdometryNode:
             self.last_time = current_time
         
         elif current_measurement is not None:
-            # If still initializing, track the time for the next cycle
             self.last_time = current_time
 
 
