@@ -72,11 +72,11 @@ class PixelOdometryNode:
         ])
 
         # Base Process Noise Covariance (Q_base): Allows for rapid changes in velocity/acceleration
-        Q_std = 0.1 
+        Q_std = 0.01 
         self.Q_base = np.eye(6) * Q_std**2
 
         # Measurement Noise Covariance (R): Near-perfect trust in the sensor (3x3)
-        R_std = 0.0001 # Set extremely low to minimize lag and follow measurement instantly
+        R_std = 0.01 # Set extremely low to minimize lag and follow measurement instantly
         self.R = np.eye(3) * R_std**2
 
         # Initial State Covariance (P): High initial uncertainty
