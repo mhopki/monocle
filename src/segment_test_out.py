@@ -16,7 +16,7 @@ class TemplateDepthTracker:
     Decoupled tracker that switches from Color-Aligned setup (needed for Zero-Shot) 
     to the faster RAW DEPTH pipeline for continuous tracking.
     
-    The initial kernel acquisition now uses rospy.wait_for_message to bypass time synchronization issues.
+    This version implements a ROTATED KERNEL BANK for rotation robustness.
     """
 
     MAX_DEPTH_VALUE = 1000.0  
@@ -28,8 +28,20 @@ class TemplateDepthTracker:
         # --- Configuration Parameters ---
         self.publish_depth_vis = rospy.get_param('~publish_depth_vis', True)
         self.publish_color_vis = rospy.get_param('~publish_color_vis', True)
-        self.depth_tolerance = rospy.get_param('~depth_tolerance', 0.2) 
+        self.depth_tolerance = rospy.get_param('~depth_tolerance', 0.15) 
         self.tracking_mode = rospy.get_param('~tracking_mode', 'combined').lower()
+        
+        # NEW VISUALIZATION CONTROLS
+        self.VIS_ALWAYS_PUBLISH = rospy.get_param('~vis_always_publish', True)
+        self.VIS_MIN_SCORE_THRESHOLD = rospy.get_param('~vis_min_score_threshold', 0.6) # Default threshold for visualization
+        
+        # Threshold for accepting any match (0.0 to 1.0)
+        self.MIN_SCORE_THRESHOLD = rospy.get_param('~score_threshold', 0.6) 
+        
+        # Rotations to test (e.g., [0, 90, 180, 270])
+        self.rotation_degrees = rospy.get_param('~rotation_degrees', [0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0])
+        rospy.loginfo(f"Rotational Robustness: {len(self.rotation_degrees)} kernels per mode.")
+        rospy.loginfo(f"Min Match Score Threshold: {self.MIN_SCORE_THRESHOLD:.2f}")
 
         # --- Fusion Parameters (for 'combined' mode) ---
         self.WEIGHT_INV = rospy.get_param('~weight_inverted', 0.5) 
@@ -44,9 +56,15 @@ class TemplateDepthTracker:
         self.intrinsics_ready = False
         
         # --- Tracking State ---
-        self.kernel_inv = None          
-        self.kernel_pos = None          
-        self.kernel_pos_mask = None     
+        self.kernel_inv = None # Base kernel for INVERTED mode (32FC1)
+        self.kernel_pos = None # Base kernel for POSITIVE mode (8UC1)
+        self.kernel_pos_mask = None # Base mask for POSITIVE mode (32FC1)
+        
+        # NEW: Lists to store all rotated versions
+        self.kernel_bank_inv = []
+        self.kernel_bank_pos = []
+        self.kernel_bank_pos_masks = []
+        
         self.kernel_avg_depth = None    
         self.kernel_w = 0               
         self.kernel_h = 0               
@@ -54,8 +72,11 @@ class TemplateDepthTracker:
 
         # Publishers
         self.tracked_depth_pub = rospy.Publisher("/tracked_raw_depth_visualization", Image, queue_size=1)
+        self.tracked_depth_pub_pos = rospy.Publisher("/tracked_raw_depth_visualization_pos", Image, queue_size=1)
         self.tracked_color_pub = rospy.Publisher("/tracked_color_visualization", Image, queue_size=1)
-        self.kernel_pub = rospy.Publisher("/tracking_kernel", Image, queue_size=1, latch=True)
+        self.kernel_pub = rospy.Publisher("/tracking_kernel", Image, queue_size=1, latch=True) 
+        self.kernel_pos_pub = rospy.Publisher("/tracking_kernel_positive", Image, queue_size=1, latch=True)
+
         self.location_pub = rospy.Publisher("/tracked_pixel_location", Point, queue_size=1) 
 
         # STAGE 1: Setup - Subscribe to Info Topics
@@ -128,6 +149,37 @@ class TemplateDepthTracker:
         depth_pixel_y = (Y_c / Z_c) * self.depth_fy + self.depth_cy
 
         return int(depth_pixel_x), int(depth_pixel_y)
+        
+    def _rotate_and_bank_kernel(self, base_kernel, base_mask, is_32f=False):
+        """
+        Generates rotated versions of a kernel and its mask for the kernel bank.
+        Returns (list_of_kernels, list_of_masks)
+        """
+        bank = []
+        mask_bank = []
+        (h, w) = base_kernel.shape
+        (cX, cY) = (w // 2, h // 2)
+
+        for angle in self.rotation_degrees:
+            # 1. Calculate the rotation matrix
+            M = cv2.getRotationMatrix2D((cX, cY), -angle, 1.0) # Negative angle for standard rotation
+            
+            # 2. Rotate the kernel
+            # Use same interpolation for all
+            if is_32f: # For Inverted Kernel (32FC1)
+                rotated_kernel = cv2.warpAffine(base_kernel, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0.0)
+            else: # For Positive Kernel (8UC1)
+                rotated_kernel = cv2.warpAffine(base_kernel, M, (w, h), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+            bank.append(rotated_kernel)
+            
+            # 3. Rotate the mask if provided (only needed for positive 8uc1 matching)
+            if base_mask is not None:
+                 # Masks must be rotated with NEAREST interpolation to preserve binary structure
+                 rotated_mask = cv2.warpAffine(base_mask, M, (w, h), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+                 mask_bank.append(rotated_mask)
+                 
+        return bank, mask_bank
 
     def _generate_positive_kernel(self, segmented_depth_array, y_min, y_max, x_min, x_max, valid_object_pixels):
         """
@@ -248,8 +300,7 @@ class TemplateDepthTracker:
                  rospy.logerr("Clamped kernel is too small. Setup failed.")
                  return
             
-            # --- 3. GENERATE KERNELS using the CLAMPED, RECENTERED RAW DEPTH PATCH ---
-            
+            # --- 3. GENERATE BASE KERNELS ---
             avg_depth_inv = None
             avg_depth_pos = None
 
@@ -275,13 +326,36 @@ class TemplateDepthTracker:
             else:
                  rospy.logerr("Kernel generation failed in chosen mode.")
                  return
+                 
+            # --- 4. POPULATE ROTATED KERNEL BANKS ---
+            
+            if self.kernel_inv is not None:
+                # Bank Inverted Kernels (32FC1, no mask needed)
+                self.kernel_bank_inv, _ = self._rotate_and_bank_kernel(
+                    self.kernel_inv, None, is_32f=True
+                )
+                
+            if self.kernel_pos is not None:
+                # Bank Positive Kernels (8UC1) and their masks (32FC1)
+                self.kernel_bank_pos, self.kernel_bank_pos_masks = self._rotate_and_bank_kernel(
+                    self.kernel_pos, self.kernel_pos_mask, is_32f=False
+                )
+
 
             # --- FINAL VISUALIZATION & SWITCH ---
+            
+            # 1. Publish primary kernel visualization (for /tracking_kernel)
             kernel_to_vis = self.kernel_inv if self.kernel_inv is not None else self.kernel_pos
             kernel_vis_8u = cv2.normalize(kernel_to_vis, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
             kernel_msg = self.bridge.cv2_to_imgmsg(kernel_vis_8u, "mono8")
             self.kernel_pub.publish(kernel_msg)
             
+            # 2. Publish POSITIVE kernel visualization (for /tracking_kernel_positive)
+            if self.kernel_pos is not None:
+                 kernel_pos_vis_msg = self.bridge.cv2_to_imgmsg(self.kernel_pos, "mono8")
+                 kernel_pos_vis_msg.header = segmented_depth_data.header
+                 self.kernel_pos_pub.publish(kernel_pos_vis_msg)
+
             self.setup_complete = True
             rospy.loginfo("STAGE 1 COMPLETE: Kernel acquired. Starting tracking loop.")
             
@@ -313,197 +387,305 @@ class TemplateDepthTracker:
     def tracking_callback(self, raw_depth_data, color_data):
         """
         The continuous, high-frequency callback executed upon receiving synchronized
-        raw depth and color images. Performs template matching and visualization.
+        raw depth and color images. Performs rotationally robust template matching and visualization.
         """
+        # Define default center location (mid-screen) for visualization failure mode
+        H_def, W_def = (raw_depth_data.height, raw_depth_data.width)
+        center_x_def, center_y_def = (W_def // 2, H_def // 2)
+        top_left_def = (center_x_def - self.kernel_w // 2, center_y_def - self.kernel_h // 2)
+        bottom_right_def = (top_left_def[0] + self.kernel_w, top_left_def[1] + self.kernel_h)
+        
+        publish_location_update = False
+        
         if not self.setup_complete:
-            return
-            
-        if self.kernel_inv is None and self.kernel_pos is None:
+            pass # Skip tracking logic
+        elif self.kernel_inv is None and self.kernel_pos is None:
             rospy.logwarn_throttle(5.0, "Tracking callback received data, but no kernel is set. Waiting.")
-            return
+        
+        else:
+            # --- ATTEMPT ROTATIONALLY ROBUST TRACKING ---
+            best_score = -1.0
+            best_loc = (0, 0)
+            best_kernel = None
+            best_angle = 0.0 # Store the best matching angle
+            tracking_mode = self.tracking_mode
 
-        # Initialize the variable that holds the best match information
-        best_score = -1.0
-        best_loc = (0, 0)
-        best_kernel = None  
-
-        try:
-            raw_depth_array = self.convert_to_32fc1_meters(raw_depth_data, raw_depth_data.encoding)
-
-            # --- CONTINUOUS TRACKING ---
-            tracking_array = raw_depth_array.copy()
-
-            # 1. Dynamic Depth Thresholding (INVERSE FILTER)
-            min_target_depth = self.kernel_avg_depth - self.depth_tolerance
-            max_target_depth = self.kernel_avg_depth + self.depth_tolerance
-
-            within_bounds_mask = (tracking_array >= min_target_depth) & \
-                               (tracking_array <= max_target_depth)
-            
-            tracking_array[within_bounds_mask] = 0.0
-            tracking_array[np.isnan(tracking_array)] = 0.0
-            
-            H, W = tracking_array.shape
-            
-            # Initialize storage for individual match results
-            res_pos = {'score': -1.0, 'loc': (0, 0), 'kernel': self.kernel_pos}
-            res_inv = {'score': -1.0, 'loc': (0, 0), 'kernel': self.kernel_inv}
-            
-            
-            # 2. Perform Matching based on Mode
-            
-            # --- POSITIVE Matching (8UC1 Data) ---
-            if self.tracking_mode in ['positive', 'combined'] and self.kernel_pos is not None:
-                h, w = self.kernel_pos.shape
+            try: # <--- Start of main tracking and visualization try block
+                # Get the pristine RAW depth array (32FC1 meters)
+                raw_depth_array_pristine = self.convert_to_32fc1_meters(raw_depth_data, raw_depth_data.encoding)
+                if raw_depth_array_pristine is None:
+                    raw_depth_array_pristine = np.zeros((H_def, W_def), dtype=np.float32) # Use blank array for vis
                 
-                if H >= h and W >= w:
+                # --- CONTINUOUS TRACKING ---
+                tracking_array = raw_depth_array_pristine.copy()
+
+                # 1. Dynamic Depth Thresholding (INVERSE FILTER)
+                min_target_depth = self.kernel_avg_depth - self.depth_tolerance
+                max_target_depth = self.kernel_avg_depth + self.depth_tolerance
+                if max_target_depth > 2.65: max_target_depth = 2.65
+
+                within_bounds_mask = (tracking_array >= min_target_depth) & \
+                                   (tracking_array <= max_target_depth)
+                
+                tracking_array[within_bounds_mask] = 0.0
+                tracking_array[np.isnan(tracking_array)] = 0.0
+                
+                H, W = tracking_array.shape
+                
+                # Initialize storage for individual match results
+                res_pos = {'score': -1.0, 'loc': (0, 0), 'kernel': None, 'angle': 0.0} 
+                res_inv = {'score': -1.0, 'loc': (0, 0), 'kernel': None, 'angle': 0.0}
+                
+                # 2. Perform Matching based on Mode (Rotational Search)
+                
+                # --- POSITIVE Matching (8UC1 Data) ---
+                if tracking_mode in ['positive', 'combined'] and self.kernel_bank_pos:
                     tracking_array_8u = cv2.normalize(tracking_array, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+                    
+                    for i, kernel in enumerate(self.kernel_bank_pos):
+                        h, w = kernel.shape
+                        if H >= h and W >= w:
+                            result_pos_i = cv2.matchTemplate(
+                                tracking_array_8u, 
+                                kernel,   
+                                cv2.TM_CCOEFF_NORMED,
+                                mask=self.kernel_bank_pos_masks[i].astype(np.uint8) 
+                            )
+                            _, max_val_i, _, max_loc_i = cv2.minMaxLoc(result_pos_i)
+                            
+                            if max_val_i > res_pos['score']:
+                                res_pos['score'] = max_val_i
+                                res_pos['loc'] = max_loc_i
+                                res_pos['kernel'] = kernel 
+                                res_pos['angle'] = self.rotation_degrees[i] # Store the angle
 
-                    result_pos = cv2.matchTemplate(
-                        tracking_array_8u, # Search array is 8UC1
-                        self.kernel_pos,   # Kernel is 8UC1
-                        cv2.TM_CCOEFF_NORMED,
-                        mask=self.kernel_pos_mask.astype(np.uint8) # Mask must be 8UC1
-                    )
-                    _, max_val_pos, _, max_loc_pos = cv2.minMaxLoc(result_pos)
-                    
-                    res_pos['score'] = max_val_pos
-                    res_pos['loc'] = max_loc_pos
-            
-            # --- INVERTED Matching (32FC1 Data) ---
-            if self.tracking_mode in ['inverted', 'combined'] and self.kernel_inv is not None:
-                h, w = self.kernel_inv.shape
                 
-                if H >= h and W >= w:
-                    result_inv = cv2.matchTemplate(tracking_array, self.kernel_inv, cv2.TM_CCOEFF_NORMED)
-                    _, max_val_inv, _, max_loc_inv = cv2.minMaxLoc(result_inv)
-                    
-                    res_inv['score'] = max_val_inv
-                    res_inv['loc'] = max_loc_inv
-            
-            
-            # 3. Determine Final Location (Fusion/Fallback)
-            
-            if self.tracking_mode == 'combined':
-                score_pos = res_pos['score']
-                score_inv = res_inv['score']
+                # --- INVERTED Matching (32FC1 Data) ---
+                if tracking_mode in ['inverted', 'combined'] and self.kernel_bank_inv:
+                    for i, kernel in enumerate(self.kernel_bank_inv):
+                        h, w = kernel.shape
+                        if H >= h and W >= w:
+                            result_inv_i = cv2.matchTemplate(tracking_array, kernel, cv2.TM_CCOEFF_NORMED)
+                            _, max_val_i, _, max_loc_i = cv2.minMaxLoc(result_inv_i)
+                            
+                            if max_val_i > res_inv['score']:
+                                res_inv['score'] = max_val_i
+                                res_inv['loc'] = max_loc_i
+                                res_inv['kernel'] = kernel 
+                                res_inv['angle'] = self.rotation_degrees[i] # Store the angle
                 
-                valid_pos = score_pos > 0.0
-                valid_inv = score_inv > 0.0
                 
-                if valid_pos and valid_inv:
-                    center_pos_x = res_pos['loc'][0] + self.kernel_w // 2
-                    center_pos_y = res_pos['loc'][1] + self.kernel_h // 2
-                    center_inv_x = res_inv['loc'][0] + self.kernel_w // 2
-                    center_inv_y = res_inv['loc'][1] + self.kernel_h // 2
+                # 3. Determine Final Location (Fusion/Fallback)
+                
+                best_match = res_pos if res_pos['score'] > res_inv['score'] else res_inv
+                
+                # Use the best single result as the fallback location
+                best_score = best_match['score']
+                best_loc = best_match['loc']
+                best_kernel = best_match['kernel']
+                best_angle = best_match['angle'] # Initialize best angle
+                
+                if tracking_mode == 'combined':
+                    score_pos = res_pos['score']
+                    score_inv = res_inv['score']
                     
-                    distance = math.sqrt(
-                        (center_pos_x - center_inv_x)**2 + 
-                        (center_pos_y - center_inv_y)**2
-                    )
+                    valid_pos = score_pos > self.MIN_SCORE_THRESHOLD # Use threshold for validity check
+                    valid_inv = score_inv > self.MIN_SCORE_THRESHOLD # Use threshold for validity check
+                    
+                    if valid_pos and valid_inv:
+                        center_pos_x = res_pos['loc'][0] + self.kernel_w // 2
+                        center_pos_y = res_pos['loc'][1] + self.kernel_h // 2
+                        center_inv_x = res_inv['loc'][0] + self.kernel_w // 2
+                        center_inv_y = res_inv['loc'][1] + self.kernel_h // 2
+                        
+                        distance = math.sqrt(
+                            (center_pos_x - center_inv_x)**2 + 
+                            (center_pos_y - center_inv_y)**2
+                        )
 
-                    if distance <= self.MAX_FUSION_DISTANCE_PIXELS:
-                        rospy.logdebug(f"Fusion accepted. Distance: {distance:.1f}px")
-                        
-                        fused_x = int(self.WEIGHT_POS * res_pos['loc'][0] + self.WEIGHT_INV * res_inv['loc'][0])
-                        fused_y = int(self.WEIGHT_POS * res_pos['loc'][1] + self.WEIGHT_INV * res_inv['loc'][1])
-                        
-                        best_loc = (fused_x, fused_y)
-                        best_kernel = self.kernel_pos if self.kernel_pos is not None else self.kernel_inv
-                        best_score = (score_pos * self.WEIGHT_POS) + (score_inv * self.WEIGHT_INV) 
-                        
+                        if distance <= self.MAX_FUSION_DISTANCE_PIXELS:
+                            rospy.logdebug(f"Fusion accepted. Distance: {distance:.1f}px")
+                            
+                            fused_x = int(self.WEIGHT_POS * res_pos['loc'][0] + self.WEIGHT_INV * res_inv['loc'][0])
+                            fused_y = int(self.WEIGHT_POS * res_pos['loc'][1] + self.WEIGHT_INV * res_inv['loc'][1])
+                            
+                            best_loc = (fused_x, fused_y)
+                            best_kernel = res_pos['kernel'] if res_pos['score'] > res_inv['score'] else res_inv['kernel']
+                            best_score = (score_pos * self.WEIGHT_POS) + (score_inv * self.WEIGHT_INV) 
+                            publish_location_update = True
+                            
+                            # Use the angle from the highest scoring kernel in the fused result
+                            best_angle = res_pos['angle'] if res_pos['score'] > res_inv['score'] else res_inv['angle']
+                            
+                        else:
+                            rospy.logwarn_throttle(1.0, f"Fusion rejected. Distance: {distance:.1f}px. Publishing visualization only.")
+                            # Do not publish pixel update
+                            
+                    elif valid_pos or valid_inv:
+                         # One kernel passed the score threshold but they weren't close enough for fusion.
+                         # Fall back to the single best-scoring kernel that passed the threshold.
+                         best_match = res_pos if res_pos['score'] > res_inv['score'] and res_pos['score'] > self.MIN_SCORE_THRESHOLD else res_inv
+                         if best_match['score'] > self.MIN_SCORE_THRESHOLD:
+                            best_loc = best_match['loc']
+                            best_kernel = best_match['kernel']
+                            best_score = best_match['score']
+                            best_angle = best_match['angle']
+                            publish_location_update = True
+                         else:
+                            rospy.logwarn_throttle(1.0, "Individual kernel match failed minimum score threshold.")
+                         
                     else:
-                        rospy.logwarn_throttle(1.0, f"Fusion rejected. Distance: {distance:.1f}px. No update published.")
-                        return 
+                         rospy.logwarn_throttle(1.0, "Combined tracking failed: neither kernel yielded a valid match (score < threshold). Publishing visualization only.")
+                         # Do not publish pixel update
                 
-                elif valid_pos: 
-                    best_loc = res_pos['loc']
-                    best_kernel = res_pos['kernel']
-                    best_score = score_pos
-                
-                elif valid_inv: 
-                    best_loc = res_inv['loc']
-                    best_kernel = res_inv['kernel']
-                    best_score = score_inv
+                # --- Individual Mode Publication Check ---
+                elif best_score > self.MIN_SCORE_THRESHOLD:
+                    publish_location_update = True
 
+                else: # Default if single mode match is below threshold
+                     rospy.logwarn_throttle(1.0, f"Tracking mode {tracking_mode} failed to find a valid match (score < {self.MIN_SCORE_THRESHOLD:.2f}). Publishing visualization only.")
+                     # Do not publish pixel update
+
+
+                # --- Final Coordinate Assignment (for visualization) ---
+                if best_kernel is not None and best_loc != (0,0):
+                    top_left = best_loc
+                    h, w = self.kernel_h, self.kernel_w 
+                    bottom_right = (top_left[0] + w, top_left[1] + h)
+                    center_x = top_left[0] + w // 2
+                    center_y = top_left[1] + h // 2
                 else:
-                    rospy.logwarn_throttle(1.0, "Combined tracking failed: neither kernel yielded a valid match.")
-                    return 
-            
-            # --- Individual Mode Fallback ---
-            elif self.tracking_mode == 'positive' and res_pos['score'] > 0:
-                best_loc = res_pos['loc']
-                best_kernel = res_pos['kernel']
+                    # Use default center/box for visualization if tracking failed
+                    center_x, center_y = center_x_def, center_y_def
+                    top_left = top_left_def
+                    bottom_right = bottom_right_def
+
+                # --- PIXEL LOCATION PUBLICATION (Only if successful match/fusion was accepted) ---
+                if publish_location_update:
+                    location_msg = Point()
+                    location_msg.x = center_x
+                    location_msg.y = center_y
+                    self.location_pub.publish(location_msg)
+
+
+                # 5. Visualization on Depth (Always published for monitoring)
+                vis_pub_inv = self.tracked_depth_pub 
+                vis_pub_pos = self.tracked_depth_pub_pos
                 
-            elif self.tracking_mode == 'inverted' and res_inv['score'] > 0:
-                best_loc = res_inv['loc']
-                best_kernel = res_inv['kernel']
-                
-            else:
-                rospy.logwarn_throttle(1.0, f"Tracking mode {self.tracking_mode} failed to find a valid match.")
-                return 
+                if self.publish_depth_vis:
+                    
+                    # Helper function to prepare and publish a visualization for a specific depth array
+                    def _publish_depth_visualization(depth_array_32f, publisher, header, current_center_x, current_center_y, current_top_left, current_bottom_right, angle_deg):
+                        # Determine if we should publish based on the toggle settings
+                        should_publish = self.VIS_ALWAYS_PUBLISH or (publish_location_update and best_score >= self.VIS_MIN_SCORE_THRESHOLD)
 
-            # Final position calculation
-            top_left = best_loc
+                        if not should_publish:
+                            return
+
+                        # 1. Normalize to 8-bit grayscale for display
+                        vis_copy = depth_array_32f.copy()
+                        min_depth_vis = np.nanmin(vis_copy[vis_copy > 0]) if np.sum(vis_copy > 0) > 0 else 0
+                        max_depth_vis = np.nanmax(vis_copy) if np.sum(vis_copy > 0) > 0 else 1
+
+                        if max_depth_vis > min_depth_vis:
+                            normalized_depth = cv2.normalize(vis_copy, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+                        else:
+                            normalized_depth = np.zeros_like(vis_copy, dtype=np.uint8)
+
+                        tracked_depth_cv = cv2.cvtColor(normalized_depth, cv2.COLOR_GRAY2BGR)
+
+                        # 2. Draw Markers and Rotated Box
+                        
+                        # Define the center and box parameters
+                        rect_center = (float(current_center_x), float(current_center_y))
+                        rect_size = (float(self.kernel_w), float(self.kernel_h)) # <-- FIX: Ensure size is float
+                        rect_angle = -angle_deg # OpenCV requires angle in degrees, often negated
+
+                        # Draw Rotated Box (using RotatedRect definition)
+                        rect = (rect_center, rect_size, rect_angle)
+                        box = cv2.boxPoints(rect)
+                        box = np.int0(box)
+                        
+                        # Change box color if location update was suppressed
+                        box_color = (255, 255, 0) if publish_location_update else (0, 255, 255) # Cyan if failed, Yellow if active
+                        cv2.polylines(tracked_depth_cv, [box], True, box_color, 2)
+                        
+                        # Draw Markers (standard cross and center dot)
+                        marker_size = 20
+                        cv2.line(tracked_depth_cv, (current_center_x, current_center_y - marker_size), (current_center_x, current_center_y + marker_size), (0, 0, 255), 2)
+                        cv2.line(tracked_depth_cv, (current_center_x - marker_size, current_center_y), (current_center_x + marker_size, current_center_y), (0, 0, 255), 2)
+                        cv2.circle(tracked_depth_cv, (current_center_x, current_center_y), 5, (0, 255, 0), -1)
+
+                        tracked_depth_msg = self.bridge.cv2_to_imgmsg(tracked_depth_cv, "bgr8")
+                        tracked_depth_msg.header = header
+                        publisher.publish(tracked_depth_msg)
+
+
+                    # A. Calculate Direct Filtered Array (ONLY OBJECT VISIBLE)
+                    min_target_depth = self.kernel_avg_depth - self.depth_tolerance
+                    max_target_depth = self.kernel_avg_depth + self.depth_tolerance
+
+                    direct_mask = (raw_depth_array_pristine >= min_target_depth) & \
+                                  (raw_depth_array_pristine <= max_target_depth)
+                    
+                    direct_filtered_array = raw_depth_array_pristine * direct_mask.astype(np.float32)
+
+                    
+                    # B. Publish INVERTED (Default) Visualization
+                    # Uses the inverse filtered array (object is black hole)
+                    _publish_depth_visualization(
+                        tracking_array, 
+                        vis_pub_inv, 
+                        raw_depth_data.header,
+                        center_x, center_y, top_left, bottom_right, best_angle
+                    )
+
+                    # C. Publish POSITIVE Visualization
+                    # Uses the direct filtered array (only object visible)
+                    _publish_depth_visualization(
+                        direct_filtered_array, 
+                        vis_pub_pos, 
+                        raw_depth_data.header,
+                        center_x, center_y, top_left, bottom_right, best_angle
+                    )
+
+                # 6. Visualization on Color Image (Always published for monitoring)
+                if self.publish_color_vis:
+                    
+                    # Determine if we should publish color vis based on the same score check
+                    should_publish_color = self.VIS_ALWAYS_PUBLISH or (publish_location_update and best_score >= self.VIS_MIN_SCORE_THRESHOLD)
+
+                    if should_publish_color:
+                        color_cv = self.bridge.imgmsg_to_cv2(color_data, "bgr8")
+                        tracked_color_cv = color_cv.copy() 
+                        
+                        # Draw the SAME markers on the color image
+                        marker_size = 20
+                        box_color = (255, 255, 0) if publish_location_update else (0, 255, 255) # Yellow if active, Cyan if failed
+                        
+                        # Redraw Rotated Box on color image
+                        rect_center = (float(center_x), float(center_y))
+                        rect_size = (float(self.kernel_w), float(self.kernel_h)) # Ensure size is float
+                        rect_angle = -best_angle 
+
+                        rect = (rect_center, rect_size, rect_angle)
+                        box = cv2.boxPoints(rect)
+                        box = np.int0(box)
+                        cv2.polylines(tracked_color_cv, [box], True, box_color, 2)
+                        
+                        # Draw center markers
+                        cv2.line(tracked_color_cv, (center_x, center_y - marker_size), (center_x, center_y + marker_size), (0, 0, 255), 2)
+                        cv2.line(tracked_color_cv, (center_x - marker_size, center_y), (center_x + marker_size, center_y), (0, 0, 255), 2)
+                        cv2.circle(tracked_color_cv, (center_x, center_y), 5, (0, 255, 0), -1)
+
+                        tracked_color_msg = self.bridge.cv2_to_imgmsg(tracked_color_cv, "bgr8")
+                        tracked_color_msg.header = color_data.header
+                        self.tracked_color_pub.publish(tracked_color_msg)
             
-            h, w = self.kernel_h, self.kernel_w 
-            
-            bottom_right = (top_left[0] + w, top_left[1] + h)
-            center_x = top_left[0] + w // 2
-            center_y = top_left[1] + h // 2
-            
-            # --- PIXEL LOCATION PUBLICATION ---
-            location_msg = Point()
-            location_msg.x = center_x
-            location_msg.y = center_y
-            self.location_pub.publish(location_msg)
-
-            # --- Visualization on Depth (Thresholded Image) ---
-            if self.publish_depth_vis:
-                vis_array = tracking_array.copy()
-
-                min_depth_vis = np.nanmin(vis_array[vis_array > 0]) if np.sum(vis_array > 0) > 0 else 0
-                max_depth_vis = np.nanmax(vis_array) if np.sum(vis_array > 0) > 0 else 1
-
-                if max_depth_vis > min_depth_vis:
-                    normalized_depth = cv2.normalize(vis_array, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
-                else:
-                    normalized_depth = np.zeros_like(vis_array, dtype=np.uint8)
-
-                tracked_depth_cv = cv2.cvtColor(normalized_depth, cv2.COLOR_GRAY2BGR)
-
-                # Draw Markers on Depth Image
-                marker_size = 20
-                cv2.line(tracked_depth_cv, (center_x, center_y - marker_size), (center_x, center_y + marker_size), (0, 0, 255), 2)
-                cv2.line(tracked_depth_cv, (center_x - marker_size, center_y), (center_x + marker_size, center_y), (0, 0, 255), 2)
-                cv2.circle(tracked_depth_cv, (center_x, center_y), 5, (0, 255, 0), -1)
-                cv2.rectangle(tracked_depth_cv, top_left, bottom_right, (255, 255, 0), 2)
-
-                tracked_depth_msg = self.bridge.cv2_to_imgmsg(tracked_depth_cv, "bgr8")
-                tracked_depth_msg.header = raw_depth_data.header
-                self.tracked_depth_pub.publish(tracked_depth_msg)
-
-            # --- Visualization on Color Image ---
-            if self.publish_color_vis:
-                color_cv = self.bridge.imgmsg_to_cv2(color_data, "bgr8")
-                tracked_color_cv = color_cv.copy() 
-                
-                # Draw the SAME markers on the color image
-                marker_size = 20
-                
-                cv2.line(tracked_color_cv, (center_x, center_y - marker_size), (center_x, center_y + marker_size), (0, 0, 255), 2)
-                cv2.line(tracked_color_cv, (center_x - marker_size, center_y), (center_x + marker_size, center_y), (0, 0, 255), 2)
-                cv2.circle(tracked_color_cv, (center_x, center_y), 5, (0, 255, 0), -1)
-                cv2.rectangle(tracked_color_cv, top_left, bottom_right, (255, 255, 0), 2)
-
-                tracked_color_msg = self.bridge.cv2_to_imgmsg(tracked_color_cv, "bgr8")
-                tracked_color_msg.header = color_data.header
-                self.tracked_color_pub.publish(tracked_color_msg)
-
-        except CvBridgeError as e:
-            rospy.logerr(f"CvBridge Error: {e}")
-        except Exception as e:
-            rospy.logerr(f"An unexpected error occurred during tracking: {e}")
+            except CvBridgeError as e:
+                rospy.logerr(f"CvBridge Error: {e}")
+            except Exception as e:
+                rospy.logerr(f"An unexpected error occurred during tracking: {e}")
 
 
 if __name__ == '__main__':

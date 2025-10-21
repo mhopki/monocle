@@ -309,7 +309,7 @@ class MiDaSDepthEstimator:
         closest_depth_m_estimated = np.nanmin(roi_depth_estimated[roi_depth_estimated > 0]) # Find min, ignore NaNs/zeros
         
         # Extract ROI from the true depth map
-        roi_depth_true = depth_true[y_start:y_end, x_start:x_end]
+        roi_depth_true = depth_true[center_y:center_y + 1, center_x:center_x + 1] #depth_true[y_start:y_end, x_start:x_end]
         closest_depth_m_true = np.nanmin(roi_depth_true[roi_depth_true > 0]) # Find min, ignore NaNs/zeros
 
 
