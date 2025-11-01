@@ -47,6 +47,10 @@ class MiDaSDepthEstimator:
         rospy.init_node('midas_depth_estimator_node', anonymous=True)
         self.bridge = CvBridge()
         
+        # --- FEATURE TOGGLE: Set to False to use True Depth image directly (no MiDaS) ---
+        self.USE_MONOCULAR_DEPTH_FOR_SCALING = False
+        # ---------------------------------------------------------------------------------
+
         # Stores the latest raw MiDaS output (float32, unnormalized) for the sync_callback
         self.last_midas_raw_numpy = None 
         # Stores the last frame's smoothed metric depth map for temporal consistency
@@ -54,7 +58,7 @@ class MiDaSDepthEstimator:
         # Time (seconds) when the U-TURN message is allowed to expire and the arrow can reappear.
         self.uturn_expire_time = 0.0 
         # Exponential Moving Average (EMA) factor for temporal smoothing 
-        self.SMOOTHING_ALPHA = 0.8 
+        self.SMOOTHING_ALPHA = 0.99 # Set to high value for fast response.
 
         # --- Arrow Smoothing Control ---
         self.ARROW_SMOOTHING_BETA = 0.1 
@@ -93,6 +97,8 @@ class MiDaSDepthEstimator:
         # ----------------------------------------------------------------------
         # 2. Synchronizer for Scaling and Comparison
         # ----------------------------------------------------------------------
+        # Both subscribers use the true depth topic because it contains the true depth image 
+        # required for the fusion pipeline (whether MiDaS is active or not).
         sub_mono_raw = message_filters.Subscriber('/camera/depth/image_rect_raw', Image) 
         sub_depth_true = message_filters.Subscriber('/camera/depth/image_rect_raw', Image)
 
@@ -170,6 +176,10 @@ class MiDaSDepthEstimator:
         """
         Performs MiDaS inference and publishes the normalized disparity map for visualization.
         """
+        # Only run MiDaS if the feature flag is enabled
+        if not self.USE_MONOCULAR_DEPTH_FOR_SCALING:
+            return
+            
         try:
             cv_rgb = self.bridge.imgmsg_to_cv2(rgb_msg, "bgr8")
         except Exception as e:
@@ -198,11 +208,6 @@ class MiDaSDepthEstimator:
         """
         rospy.loginfo("Received synchronized depth messages. Processing scaling and comparison...")
 
-        depth_midas_raw = self.last_midas_raw_numpy
-        if depth_midas_raw is None:
-            rospy.logwarn("Raw MiDaS data not available. Skipping sync callback.")
-            return
-
         try:
             depth_true = self.process_true_depth(depth_true_msg)
             if depth_true is None:
@@ -212,21 +217,22 @@ class MiDaSDepthEstimator:
             rospy.logerr(f"Error converting synchronized images: {e}")
             return
 
-        # ----------------------------------------------------------------------
-        # 2. Dynamic Cone Range Check and Metric Scaling
-        # ----------------------------------------------------------------------
+        # --- Setup for Dimensions ---
         H, W = depth_true.shape
         center_y, center_x = H // 2, W // 2
-        
-        depth_midas_aligned = cv2.resize(depth_midas_raw, (W, H), 
-                                         interpolation=cv2.INTER_LINEAR)
-
         FAR_AWAY_PROXY_DISPARITY = 1e-4 
         MIN_ACQ = self.MIN_ACQUISITION_M
         
-        # --- A. Fixed Max Cone Search ROI (Simulates Sensor FoV) ---
-        # The sensor can physically see everything within the 27-degree cone at 3.0m.
-        # This defines the physical search boundary.
+        # --- Visualization Constants (Moved here to be globally accessible) ---
+        VIS_MIN_DEPTH = 0.1
+        VIS_MAX_DEPTH = 10.0
+        # ----------------------------------------------------------------------
+        
+        # ----------------------------------------------------------------------
+        # 2. Metric Anchor Acquisition (Simulated ToF)
+        # ----------------------------------------------------------------------
+        
+        # --- A. Fixed Max Cone Search ROI (Defines physical FoV of the ToF sensor) ---
         MAX_RADIUS = self.MAX_CONE_RADIUS_PIXELS 
         y_max_start = max(0, center_y - MAX_RADIUS)
         y_max_end = min(H, center_y + MAX_RADIUS)
@@ -249,6 +255,9 @@ class MiDaSDepthEstimator:
         # --- B. Add Simulated ToF Noise and Dropout ---
         true_min_val = self.add_simulated_tof_noise(true_min_for_radius_base)
 
+        # --- C. Range Check (The physical status of the sensor) ---
+        sensor_is_active = true_min_val <= self.SENSOR_MAX_RANGE and true_min_val > MIN_ACQ
+
         # 1. Calculate Dynamic Radius (R_cone = MIN_R + Z * Slope)
         CONE_RADIUS_PIXELS = max(self.MIN_CONE_RADIUS_PIXELS, 
                                  int(true_min_val * self.CONE_SLOPE_PIXELS_PER_METER))
@@ -256,59 +265,85 @@ class MiDaSDepthEstimator:
         MAX_R = min(H, W) // 2 - 1 
         CONE_RADIUS_PIXELS = min(CONE_RADIUS_PIXELS, MAX_R)
 
-        # --- C. Range Check ---
-        sensor_is_active = true_min_val <= self.SENSOR_MAX_RANGE and true_min_val > MIN_ACQ
+        # ----------------------------------------------------------------------
+        # 3. Scaling & Fusion Selection
+        # ----------------------------------------------------------------------
+        
+        if self.USE_MONOCULAR_DEPTH_FOR_SCALING:
+            depth_midas_raw = self.last_midas_raw_numpy
+            if depth_midas_raw is None:
+                rospy.logwarn("Monocular mode enabled, but MiDaS raw data is missing.")
+                return
 
-        # --- D. Metric Scaling (Only if sensor is successfully in range) ---
-        if sensor_is_active:
-            # Re-Extract MDE ROI using the dynamic cone size for the median anchor
+            depth_midas_aligned = cv2.resize(depth_midas_raw, (W, H), interpolation=cv2.INTER_LINEAR)
+            
+            if sensor_is_active:
+                # Monocular Mode: Calculate scale based on MiDaS disparity and True Depth min
+                
+                # Extract MDE ROI using the dynamic cone size for the median anchor
+                y_start = max(0, center_y - CONE_RADIUS_PIXELS)
+                y_end = min(H, center_y + CONE_RADIUS_PIXELS)
+                x_start = max(0, center_x - CONE_RADIUS_PIXELS)
+                x_end = min(W, center_x + CONE_RADIUS_PIXELS) 
+                
+                roi_midas = depth_midas_aligned[y_start:y_end, x_start:x_end]
+                valid_midas = roi_midas[np.isfinite(roi_midas) & (roi_midas > 0)]
+                midas_median_val = np.median(valid_midas) if valid_midas.size > 0 else FAR_AWAY_PROXY_DISPARITY
+
+                # Scale Factor S' = Z_true_min * D_midas_median
+                scale_factor_s_prime = true_min_val * midas_median_val
+
+                # Apply the scale factor to get metric depth in meters (D_midas -> Z_scaled)
+                epsilon = 1e-6
+                depth_to_smooth = scale_factor_s_prime / (depth_midas_aligned + epsilon)
+            else:
+                # If sensor is inactive in Monocular Mode, use the previous frame's scale, or assume far
+                scale_factor_s_prime = 0.0
+                depth_to_smooth = np.ones_like(depth_true) * VIS_MAX_DEPTH
+                if self.last_depth_scaled_smoothed is not None:
+                    depth_to_smooth = self.last_depth_scaled_smoothed # Hold the last valid map
+                
+        else:
+            # True Depth Mode: No scaling required (S'=1), use True Depth image directly
+            scale_factor_s_prime = 1.0
+            depth_to_smooth = depth_true
             y_start = max(0, center_y - CONE_RADIUS_PIXELS)
             y_end = min(H, center_y + CONE_RADIUS_PIXELS)
             x_start = max(0, center_x - CONE_RADIUS_PIXELS)
             x_end = min(W, center_x + CONE_RADIUS_PIXELS)
-            roi_midas = depth_midas_aligned[y_start:y_end, x_start:x_end]
-            valid_midas = roi_midas[np.isfinite(roi_midas) & (roi_midas > 0)]
-            midas_median_val = np.median(valid_midas) if valid_midas.size > 0 else FAR_AWAY_PROXY_DISPARITY
 
-            # Scale Factor S' = Z_true_min * D_midas_median
-            scale_factor_s_prime = true_min_val * midas_median_val
-
-            # Apply the scale factor to get metric depth in meters
-            epsilon = 1e-6
-            depth_midas_scaled = scale_factor_s_prime / (depth_midas_aligned + epsilon)
+        # --- Temporal Smoothing (EMA) ---
+        depth_midas_smoothed = depth_to_smooth.copy()
+        
+        # APPLY EMA IF HISTORY EXISTS, REGARDLESS OF TOGGLE STATE
+        if self.last_depth_scaled_smoothed is not None:
+            last_smoothed_aligned = cv2.resize(self.last_depth_scaled_smoothed, (W, H), 
+                                                interpolation=cv2.INTER_LINEAR)
             
-            # --- Temporal Smoothing (EMA) ---
-            depth_midas_smoothed = depth_midas_scaled.copy()
+            alpha = self.SMOOTHING_ALPHA
+            valid_mask = np.isfinite(depth_to_smooth) & (depth_to_smooth > 0)
+            valid_mask_prev = np.isfinite(last_smoothed_aligned) & (last_smoothed_aligned > 0)
+            common_valid_mask = valid_mask & valid_mask_prev
             
-            if self.last_depth_scaled_smoothed is not None:
-                last_smoothed_aligned = cv2.resize(self.last_depth_scaled_smoothed, (W, H), 
-                                                    interpolation=cv2.INTER_LINEAR)
-                
-                alpha = self.SMOOTHING_ALPHA
-                valid_mask = np.isfinite(depth_midas_scaled) & (depth_midas_scaled > 0)
-                valid_mask_prev = np.isfinite(last_smoothed_aligned) & (last_smoothed_aligned > 0)
-                common_valid_mask = valid_mask & valid_mask_prev
-                
-                depth_midas_smoothed[common_valid_mask] = (alpha * depth_midas_scaled[common_valid_mask] + 
-                                                          (1 - alpha) * last_smoothed_aligned[common_valid_mask])
-
-            self.last_depth_scaled_smoothed = depth_midas_smoothed.copy()
-            
-            self.pub_mono_scaled.publish(self.bridge.cv2_to_imgmsg(depth_midas_smoothed, "32FC1", depth_true_msg.header))
-            rospy.loginfo(f"Scale Factor (S'): {scale_factor_s_prime:.4f}. Smoothed scaled depth published.")
+            depth_midas_smoothed[common_valid_mask] = (alpha * depth_to_smooth[common_valid_mask] + 
+                                                      (1 - alpha) * last_smoothed_aligned[common_valid_mask])
+        
+        # ALWAYS SAVE THE RESULTING SMOOTHED MAP (UNIFIED FUNCTIONALITY)
+        self.last_depth_scaled_smoothed = depth_midas_smoothed.copy()
+        
+        # ... (rest of the publishing logic)
+        self.pub_mono_scaled.publish(self.bridge.cv2_to_imgmsg(depth_midas_smoothed, "32FC1", depth_true_msg.header))
+        rospy.loginfo(f"Scale Factor (S'): {scale_factor_s_prime:.4f}. Smoothed scaled depth published.")
         
         # ----------------------------------------------------------------------
-        # 3. Visualization and Drawing (/mono/depth/image_draw)
+        # 4. Visualization and Drawing (/mono/depth/image_draw)
         # ----------------------------------------------------------------------
         
-        smooth_map_for_vis = self.last_depth_scaled_smoothed
+        smooth_map_for_vis = depth_midas_smoothed # Use the newly computed, lag-free map
         if smooth_map_for_vis is None:
             rospy.logwarn("Skipping visualization: Smoothed depth map not initialized.")
             return
 
-        VIS_MIN_DEPTH = 0.1
-        VIS_MAX_DEPTH = 10.0
-        
         visual_map = np.clip(smooth_map_for_vis, VIS_MIN_DEPTH, VIS_MAX_DEPTH)
         
         normalized_vis_map = ((visual_map - VIS_MIN_DEPTH) / (VIS_MAX_DEPTH - VIS_MIN_DEPTH)) * 255.0
